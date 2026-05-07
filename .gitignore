@@ -1,0 +1,35 @@
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# colcon / ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime artifacts (recorded audio, captured images, generated TTS)
+recorded_audio.wav
+captured_image.jpg
+compressed_image.jpg
+*.mp3
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models / large files (HF cache lives in ~/.cache; just in case)
+*.pt
+*.bin
+*.onnx
