@@ -100,7 +100,19 @@ class Prompt(Node):
         for item in config_data['pre_dock_position']:
             for key, value in item.items():
                 self.pre_dock_position[key] = {'x': value[0], 'y': value[1], 'yaw': value[2]}
-        
+
+        self.aria_context = ""
+        context_path = os.path.join(
+            get_package_share_directory('ai_assist'), 'aria_context.md'
+        )
+        try:
+            with open(context_path, 'r') as f:
+                self.aria_context = f.read()
+            self.get_logger().info(f"Loaded ARIA context from {context_path}")
+        except FileNotFoundError:
+            self.get_logger().warn(
+                f"aria_context.md not found at {context_path}; running without identity context."
+            )
 
         self.pose_subscription = self.create_subscription(
             Odometry,  
@@ -240,6 +252,24 @@ class Prompt(Node):
                 'Every action object MUST have an "action" key with the action name as its string value. '
                 'Do NOT use the action name as the key.'
             )
+
+            if self.aria_context:
+                system_prompt += (
+                    "\n\n=== About yourself ===\n"
+                    "The text below is your background reference, organized in markdown sections.\n"
+                    "- When the user asks you to 'introduce yourself' / 'who are you' / "
+                    "'tell me about yourself' / 'what are you', emit a single speak action whose "
+                    "'text' field is the `## Intro` section reproduced VERBATIM (word-for-word, "
+                    "including the opening 'Hey! I'm A.R.I.A...').\n"
+                    "- For any other identity / capability / creator / technology question, "
+                    "use the `## Context` and `## Creators` sections as background and paraphrase "
+                    "naturally in 1-2 short sentences for TTS.\n"
+                    "- Note: the user's microphone is transcribed by speech-to-text and your name "
+                    "'ARIA' is often mis-heard as 'arya', 'aria', 'area', 'aaria', or similar phonetic "
+                    "variants — treat ALL such forms as referring to YOU, never as separate words "
+                    "or unknown entities.\n"
+                    f"---\n{self.aria_context}"
+                )
 
             content = self._call_vision(
                 system=system_prompt,

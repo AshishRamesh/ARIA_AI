@@ -9,7 +9,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['package.xml', '../aria_context.md']),
         ('share/' + package_name + '/config', ['ai_assist/config.yaml']),
     ],
     install_requires=['setuptools'],
