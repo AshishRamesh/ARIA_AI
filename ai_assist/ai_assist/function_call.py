@@ -9,9 +9,7 @@ from nav_msgs.msg import Odometry
 from dotenv import load_dotenv
 from openai import OpenAI
 from nav2_msgs.action import NavigateToPose
-from PIL import Image as PILImage
 from kokoro import KPipeline
-from io import BytesIO
 from rclpy.executors import MultiThreadedExecutor
 from ament_index_python.packages import get_package_share_directory
 
@@ -45,7 +43,7 @@ class Prompt(Node):
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         self.image_sub = self.create_subscription(
             Image,
-            "/camera/image_raw/uncompressed",
+            "/camera/image_raw",
             self.image_callback,
             rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value
         )
@@ -119,12 +117,19 @@ class Prompt(Node):
 
 
     def image_callback(self, data):
-        """Receives and converts camera images."""
         try:
-            self.cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")  
-            self.get_logger().info("Image received.")
+            self.cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:
             self.get_logger().error(f"CV Bridge Error: {e}")
+
+    def get_current_frame_b64(self, size=(320, 180), quality=80):
+        if self.cv_image is None:
+            return None
+        resized = cv2.resize(self.cv_image, size)
+        ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
 
     def draw_text(self, text):
         self.screen.fill(self.BG_COLOR)
@@ -168,28 +173,86 @@ class Prompt(Node):
     def stop_recording(self):
         self.recording = False
 
+    def _call_vision(self, system, prompt, frames=None, json_mode=False, model="gpt-4o-mini", temperature=0):
+        user_content = [{"type": "text", "text": prompt}]
+        for fb64 in (frames or []):
+            if not fb64:
+                continue
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{fb64}", "detail": "low"},
+            })
+        kwargs = dict(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=temperature,
+        )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = self.client.chat.completions.create(**kwargs)
+        return (response.choices[0].message.content or "").strip()
+
     def get_gpt_response(self, prompt):
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are controlling a robot. Convert the given command into a structured JSON list of actions. "
-                           "Each action must have 'action' (mov_cmd, nav_goal, docking, capture, or stop). "
-                           "If these 4 location (petrol pump,burger king,apartment area and parking) is mentioned, use 'nav_goal'. If just movement is mentioned, use 'mov_cmd'. "
-                           f"Available predefined locations: {self.pre_dock_position}"
-                           "Return ONLY JSON, with no extra text."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                tools=first_tools + second_tools,
+            img_b64 = self.get_current_frame_b64()
+            if img_b64:
+                self.get_logger().info("Including current camera frame as context.")
+            else:
+                self.get_logger().warn("No camera frame available — sending text only.")
+
+            system_prompt = (
+                "You are ARIA, a friendly autonomous mobile robot. You receive a live camera image "
+                "showing what you currently see. Convert the user's command into a JSON list of actions. "
+                "Available actions:\n"
+                "  - mov_cmd: relative movement, fields 'linear_x' (meters, positive=forward) "
+                "and 'angular_z' (radians, positive=left). Use for simple motion commands "
+                "('turn left', 'back up one meter'). Multiple mov_cmd actions can be chained.\n"
+                "  - nav_goal: navigate to a named map location, field 'location'. ONLY use the EXACT keys: "
+                f"{list(self.pre_dock_position.keys())}. Never invent locations or pass null.\n"
+                "  - docking: dock to an ArUco marker (no fields)\n"
+                "  - stop: halt all motion\n"
+                "  - speak: reply with text, field 'text'. USE THIS for ANY question or conversational request "
+                "(e.g. 'what do you see', 'what color is the mug', 'what's written on the bottle', 'how many people', "
+                "'where is the door'). Look at the attached camera image and answer the user's SPECIFIC question "
+                "directly in 1-2 short sentences. Do NOT just describe the whole scene unless that's what was asked. "
+                "If you can't tell from the image, say so honestly.\n"
+                "  - look_around: rotate in place, capturing several frames, then summarize the surrounding environment. "
+                "Optional fields 'n_frames' (default 4) and 'total_angle_rad' (default ~6.28 = full circle). "
+                "Use this when the user wants a panoramic survey ('look around', 'scan the room', 'check what's behind you').\n"
+                "  - visual_goto: drive toward an object/person visible (or expected to be visible) in the camera, "
+                "field 'target' (free-text description, e.g. 'the red box', 'the person', 'the door'). "
+                "Use this for ANY 'go to / approach / find / move toward X' command where X is a visual target rather "
+                "than a named map location. The robot will close a vision loop until it reaches the target.\n"
+                f"Predefined locations: {self.pre_dock_position}. "
+                'Respond with a JSON object of EXACTLY this shape: '
+                '{"actions": [{"action": "<name>", ...fields}]}. '
+                'Examples:\n'
+                '{"actions":[{"action":"speak","text":"I see a desk and a chair."}]}\n'
+                '{"actions":[{"action":"mov_cmd","linear_x":1.0,"angular_z":0.0},'
+                '{"action":"mov_cmd","linear_x":0.0,"angular_z":-1.57}]}\n'
+                '{"actions":[{"action":"nav_goal","location":"burger_king"}]}\n'
+                '{"actions":[{"action":"look_around"}]}\n'
+                '{"actions":[{"action":"look_around","n_frames":8}]}\n'
+                '{"actions":[{"action":"visual_goto","target":"the person you see"}]}\n'
+                'Every action object MUST have an "action" key with the action name as its string value. '
+                'Do NOT use the action name as the key.'
             )
-            content = response.choices[0].message.content.strip()
-            if content.startswith("```json"):
-                content = content.strip("```json").strip("```")
-            actions = json.loads(content)
+
+            content = self._call_vision(
+                system=system_prompt,
+                prompt=prompt,
+                frames=[img_b64] if img_b64 else [],
+                json_mode=True,
+            )
+            print(f"GPT raw: {content}")
+            if not content:
+                print("GPT returned empty content.")
+                return None
+            data = json.loads(content)
+            actions = data.get("actions") if isinstance(data, dict) else data
             return actions if isinstance(actions, list) else None
         except Exception as e:
             print(f"GPT Error: {e}")
@@ -230,90 +293,112 @@ class Prompt(Node):
         time.sleep(1)
         self.publisher_.publish(Twist())  # Stop after a short move
 
-    def capture(self):
-        image_file = self.capture_image()
-        if image_file:
-            self.send_image_for_description(image_file)
-            return "Captured and described image."
-        return "Failed to capture image."
+    def look_around(self, n_frames=4, total_angle_rad=2 * math.pi):
+        try:
+            n_frames = max(1, int(n_frames))
+        except (TypeError, ValueError):
+            n_frames = 4
+        try:
+            total_angle_rad = float(total_angle_rad)
+        except (TypeError, ValueError):
+            total_angle_rad = 2 * math.pi
+        step = total_angle_rad / n_frames
+        self.get_logger().info(
+            f"Look-around: {n_frames} frames over {math.degrees(total_angle_rad):.0f}° "
+            f"(step {math.degrees(step):.0f}°)"
+        )
 
+        frames = []
+        for i in range(n_frames):
+            time.sleep(0.3)  # let the camera settle after motion
+            fb64 = self.get_current_frame_b64()
+            if fb64:
+                frames.append(fb64)
+            if i < n_frames - 1:
+                self.move(0.0, step)
 
-    def capture_image(self, filename='captured_image.jpg'):
-        """Captures an image from the ROS2 camera topic and resizes it before saving."""
-        if self.cv_image is None:
-            self.get_logger().error("No image received yet. Waiting for image...")
-            rclpy.spin_once(self, timeout_sec=2.0)
-            if self.cv_image is None:
-                self.get_logger().error("Still no image received. Cannot capture.")
-                return None
+        if not frames:
+            return "I couldn't capture any camera frames while looking around."
 
         try:
-            resized_image = cv2.resize(self.cv_image, (640, 360))
-            cv2.imwrite(filename, resized_image)
-            self.get_logger().info(f"Image saved as {filename} (Resized to 640x360)")
-            return filename
-        except Exception as e:
-            self.get_logger().error(f"Failed to save image: {e}")
-            return None
-
-
-    def encode_image(self, image_path):
-        """Encodes an image to Base64 format for OpenAI API."""
-        try:
-            with open(image_path, "rb") as image_file:
-                return base64.b64encode(image_file.read()).decode('utf-8')
-        except Exception as e:
-            self.get_logger().error(f"Error encoding image: {e}")
-            return None
-
-    def resize_and_compress_image(self,image_path, output_path='compressed_image.jpg', size=(320, 180), quality=80):
-        """Resizes and compresses the image to reduce file size."""
-        with PILImage.open(image_path) as img:
-            img = img.resize(size, PILImage.LANCZOS) 
-            img.save(output_path, "JPEG", quality=quality)  
-        return output_path
-
-    def send_image_for_description(self, image_file):
-        """Sends the captured image to OpenAI's API for description."""
-        if image_file:
-            compressed_image = self.resize_and_compress_image(image_file)
-        
-        base64_image = self.encode_image(compressed_image)
-        if not base64_image:
-            return
-
-        try:
-            response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a Autonomous Mobile Robot and can describe what you see keep it short. "
-                 "Also give response starting with I see and you dont have to mention if the image is blur or dim "},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe this image:"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]
-                }
-            ],
-            max_tokens=500,
-            n=1,
+            summary = self._call_vision(
+                system=(
+                    "You are ARIA's perception system. Several frames were captured at evenly "
+                    "spaced angles while the robot rotated in place. Combine them into a 2-3 "
+                    "sentence summary of the surrounding environment, starting with 'I see'. "
+                    "Mention notable objects on different sides if relevant. Do not list each "
+                    "frame separately — give one cohesive summary."
+                ),
+                prompt=f"{len(frames)} frames captured at {math.degrees(step):.0f}° intervals.",
+                frames=frames,
+                json_mode=False,
             )
-            description = response.choices[0].message.content.strip().lower()
-            self.get_logger().info(f"Image Description: {description}")
-            self.draw_text(f"Image Description: {description}")
-            self.speak(description)
         except Exception as e:
-            self.get_logger().error(f"Error during OpenAI API request: {e}")
-        finally:
-            # Clean up the image files
-            for file_path in [image_file, compressed_image]:
-                try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        self.get_logger().info(f"Deleted temporary image file: {file_path}")
-                except Exception as e:
-                    self.get_logger().warn(f"Could not delete {file_path}: {e}")
+            self.get_logger().error(f"Look-around summary failed: {e}")
+            return "I looked around but couldn't summarize what I saw."
+        return summary or "I looked around but didn't see much worth mentioning."
+
+    def visual_goto(self, target, max_iters=8, deadline_s=30.0):
+        if not target:
+            return "I need a target to go to."
+        self.get_logger().info(f"Visual goto: {target!r}")
+        deadline = time.time() + deadline_s
+
+        for it in range(max_iters):
+            if time.time() > deadline:
+                self.get_logger().warn("Visual goto: deadline exceeded")
+                break
+
+            fb64 = self.get_current_frame_b64()
+            if not fb64:
+                return "I don't have a camera image to work with."
+
+            try:
+                raw = self._call_vision(
+                    system=(
+                        "You are vision for a ground robot servoing toward a target shown in "
+                        "the camera image. Reply with a JSON object: {"
+                        "\"found\": boolean, "
+                        "\"x_offset\": number in [-1,1] (negative=left, positive=right) for the target's "
+                        "horizontal position relative to the image center, "
+                        "\"forward_m\": number (suggested forward step in meters; 0 if at target or unsure), "
+                        "\"reached\": boolean (true if the robot is close to and centered on the target), "
+                        "\"lost\": boolean (true if the target is not visible in this frame), "
+                        "\"note\": short string status}."
+                    ),
+                    prompt=f"Target to approach: {target}",
+                    frames=[fb64],
+                    json_mode=True,
+                )
+                obs = json.loads(raw) if raw else {}
+            except Exception as e:
+                self.get_logger().error(f"Visual goto vision call failed: {e}")
+                return f"Vision failed while approaching {target}."
+
+            self.get_logger().info(f"  iter {it}: {obs}")
+
+            if obs.get("reached"):
+                return f"Reached {target}."
+            if obs.get("lost") or not obs.get("found", False):
+                self.move(0.0, math.pi / 4)  # search rotate ~45° left
+                continue
+
+            try:
+                x_off = float(obs.get("x_offset", 0.0))
+            except (TypeError, ValueError):
+                x_off = 0.0
+            if abs(x_off) > 0.10:
+                self.move(0.0, -x_off * 0.6)  # turn proportional, gentle
+
+            try:
+                step_m = float(obs.get("forward_m", 0.0))
+            except (TypeError, ValueError):
+                step_m = 0.0
+            step_m = max(0.0, min(step_m, 0.5))
+            if step_m > 0.0:
+                self.move(step_m, 0.0)
+
+        return f"Could not reach {target}."
 
     def speak(self, text, language='en'):
         if not text:
@@ -321,28 +406,67 @@ class Prompt(Node):
         for _, _, audio in self.tts_pipeline(text, voice=self.tts_voice, speed=1.0):
             self.tts_stream.write(np.asarray(audio, dtype=np.float32))
 
+    def _normalize_action(self, action):
+        if not isinstance(action, dict):
+            return {}
+        if action.get("action"):
+            return action
+        known = {"mov_cmd", "nav_goal", "docking", "stop", "speak", "look_around", "visual_goto"}
+        for key, val in action.items():
+            if key in known:
+                normalized = {"action": key}
+                if isinstance(val, dict):
+                    normalized.update(val)
+                elif isinstance(val, str):
+                    if key == "speak":
+                        normalized["text"] = val
+                    elif key == "nav_goal":
+                        normalized["location"] = val
+                    elif key == "visual_goto":
+                        normalized["target"] = val
+                return normalized
+        return action
+
     def call_function_based_on_command(self, command):
         actions = self.get_gpt_response(command)
         if actions is None:
             return "GPT returned invalid format."
+        if not actions:
+            return ["I'm not sure what to do."]
         results = []
         for action in actions:
+            action = self._normalize_action(action)
             action_type = action.get("action")
             if action_type == "mov_cmd":
                 self.move(float(action.get("linear_x", 0)), float(action.get("angular_z", 0)))
                 results.append(f"Moved {action.get('linear_x', 0)} meters , rotated {action.get('angular_z', 0)} radians.")
-            elif action_type == "capture":
-                results.append(self.capture())
             elif action_type == "nav_goal":
                 location = action.get("location")
-                print("Moving to:", location)
-                self.move_to_goal(location)
-                results.append(f"Moved to {location}.")
+                if not location or location not in self.pre_dock_position:
+                    results.append(f"Unknown location '{location}'. Known: {list(self.pre_dock_position.keys())}")
+                else:
+                    print("Moving to:", location)
+                    self.move_to_goal(location)
+                    results.append(f"Moved to {location}.")
             elif action_type == "docking":
                 if self.timer is not None:
                     self.timer.cancel()
                 self.timer = self.create_timer(0.1, self.timer_callback_aruco)
                 results.append("Docking with marker.")
+            elif action_type == "speak":
+                results.append(action.get("text", ""))
+            elif action_type == "stop":
+                self.stop_robot()
+                results.append("Stopped.")
+            elif action_type == "look_around":
+                results.append(self.look_around(
+                    n_frames=action.get("n_frames", 4),
+                    total_angle_rad=action.get("total_angle_rad", 2 * math.pi),
+                ))
+            elif action_type == "visual_goto":
+                results.append(self.visual_goto(action.get("target")))
+            else:
+                results.append(f"Unknown action: {action_type}")
         return results
 
     def stop_and_transcribe(self):
