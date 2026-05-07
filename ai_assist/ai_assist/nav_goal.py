@@ -8,15 +8,18 @@ from rclpy.node import Node
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
-from tf_transformations import quaternion_from_euler, euler_from_quaternion 
-from std_srvs.srv import Trigger 
+from tf_transformations import quaternion_from_euler, euler_from_quaternion
+from std_srvs.srv import Trigger
+from ament_index_python.packages import get_package_share_directory
 
 class eBotNav(Node):
     def __init__(self):
         super().__init__('nav_cmd')
         self.client = ActionClient(self, NavigateToPose, 'navigate_to_pose') 
 
-        file_path = "/home/ashish/ros2/avinya_ws/src/ai_assist/ai_assist/config.yaml"
+        file_path = os.path.join(
+            get_package_share_directory('ai_assist'), 'config', 'config.yaml'
+        )
 
         with open(file_path, 'r') as file:
             config_data = yaml.safe_load(file)

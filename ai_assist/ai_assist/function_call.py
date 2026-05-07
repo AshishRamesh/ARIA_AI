@@ -1,4 +1,5 @@
-import rclpy, time, os, cv2, yaml,base64, pygame, whisper,time, math,  sys, queue, threading, wave, json, numpy as np, sounddevice as sd
+import rclpy, time, os, cv2, yaml,base64, pygame, time, math,  sys, queue, threading, wave, json, numpy as np, sounddevice as sd
+from faster_whisper import WhisperModel
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import PoseStamped, Twist , Point
@@ -9,9 +10,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from nav2_msgs.action import NavigateToPose
 from PIL import Image as PILImage
-from gtts import gTTS
+from kokoro import KPipeline
 from io import BytesIO
 from rclpy.executors import MultiThreadedExecutor
+from ament_index_python.packages import get_package_share_directory
 
 if not hasattr(np, 'float'):
     np.float = float  # patch deprecated alias
@@ -31,7 +33,14 @@ class Prompt(Node):
     def __init__(self):
         super().__init__('ai_assist_engine')
         pygame.init()
-        pygame.mixer.init()
+
+        self.tts_pipeline = KPipeline(lang_code="a")
+        self.tts_voice = "af_heart"
+        self.tts_sample_rate = 24000
+        self.tts_stream = sd.OutputStream(
+            samplerate=self.tts_sample_rate, channels=1, dtype="float32"
+        )
+        self.tts_stream.start()
 
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         self.image_sub = self.create_subscription(
@@ -46,15 +55,16 @@ class Prompt(Node):
         self.sub_aruco = self.create_subscription(
             Point, '/detected_marker', self.listener_callback, 10)
 
-        self.client = OpenAI(
-            base_url="https://models.inference.ai.azure.com",
-            api_key=os.getenv('API_KEY')
-        )
+        self.client = OpenAI(api_key=os.getenv('API_KEY'))
 
-        self.timer = self.create_timer(1.0, self.process_voice_command)
+        self.timer = None
 
         # Whisper & Audio setup
-        self.model = whisper.load_model("base", device="cpu")
+        import torch
+        whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if whisper_device == "cuda" else "int8"
+        self.get_logger().info(f"Loading faster-whisper small.en on {whisper_device} ({compute_type})...")
+        self.model = WhisperModel("small.en", device=whisper_device, compute_type=compute_type)
         self.SAMPLE_RATE = 44100
         self.FILENAME = "recorded_audio.wav"
         self.audio_queue = queue.Queue()
@@ -81,7 +91,9 @@ class Prompt(Node):
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose') 
 
 
-        file_path = "/home/ashish/ros2/avinya_ws/src/ai_assist/ai_assist/config.yaml"
+        file_path = os.path.join(
+            get_package_share_directory('ai_assist'), 'config', 'config.yaml'
+        )
 
         with open(file_path, 'r') as file:
             config_data = yaml.safe_load(file)
@@ -98,9 +110,12 @@ class Prompt(Node):
             self.pose_callback,
             10)
 
-        self.current_pose = None  
-        self.get_logger().info('Waiting for action server...')
-        self.nav_client.wait_for_server()
+        self.current_pose = None
+        self.get_logger().info('Waiting for nav action server (5s)...')
+        if self.nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().info('Nav action server ready.')
+        else:
+            self.get_logger().warn('Nav action server not available — nav_goal will fail until Nav2 is running.')
 
 
     def image_callback(self, data):
@@ -300,18 +315,11 @@ class Prompt(Node):
                 except Exception as e:
                     self.get_logger().warn(f"Could not delete {file_path}: {e}")
 
-    def speak(self,text, language='en'):
-        mp3_fo = BytesIO()
-        tts = gTTS(text, lang=language)
-        tts.write_to_fp(mp3_fo)
-        mp3_fo.seek(0)
-        sound = pygame.mixer.Sound(mp3_fo)
-        sound.play()
-        self.wait_for_audio()
-
-    def wait_for_audio(self):
-        while pygame.mixer.get_busy():
-            time.sleep(1)
+    def speak(self, text, language='en'):
+        if not text:
+            return
+        for _, _, audio in self.tts_pipeline(text, voice=self.tts_voice, speed=1.0):
+            self.tts_stream.write(np.asarray(audio, dtype=np.float32))
 
     def call_function_based_on_command(self, command):
         actions = self.get_gpt_response(command)
@@ -331,9 +339,10 @@ class Prompt(Node):
                 self.move_to_goal(location)
                 results.append(f"Moved to {location}.")
             elif action_type == "docking":
-                self.timer.cancel()
+                if self.timer is not None:
+                    self.timer.cancel()
                 self.timer = self.create_timer(0.1, self.timer_callback_aruco)
-                # results.append()
+                results.append("Docking with marker.")
         return results
 
     def stop_and_transcribe(self):
@@ -346,8 +355,8 @@ class Prompt(Node):
                 wf.writeframes(np.concatenate(self.frames).astype(np.int16).tobytes())
 
             try:
-                result = self.model.transcribe(self.FILENAME)
-                self.transcribed_text = result["text"].strip()
+                segments, _ = self.model.transcribe(self.FILENAME, beam_size=5, vad_filter=True)
+                self.transcribed_text = " ".join(s.text for s in segments).strip()
             except Exception as e:
                 self.transcribed_text = "Error in transcription."
                 print("Transcription error:", e)
@@ -358,8 +367,13 @@ class Prompt(Node):
         print("Final Transcription:", self.transcribed_text)
         result = self.call_function_based_on_command(self.transcribed_text)
         print("Function Output:")
-        for step, action in enumerate(result, start=1):
-            print(f"  Step {step}: {action}")
+        if isinstance(result, str):
+            print(f"  {result}")
+            self.speak(result)
+        else:
+            for step, action in enumerate(result, start=1):
+                print(f"  Step {step}: {action}")
+                self.speak(action)
 
     def process_voice_command(self):
         self.proc()
@@ -400,8 +414,9 @@ class Prompt(Node):
             else:
                 self.get_logger().info('Reached target distance. Stopping.')
                 msg.linear.x = 0.0  # Stop movement
-                self.timer.cancel()
-                self.timer = self.create_timer(1.0, self.process_voice_command)
+                if self.timer is not None:
+                    self.timer.cancel()
+                self.timer = None
 
             msg.angular.z = -0.7 * self.target_x  # Rotate to align with marker
         else:
@@ -523,15 +538,19 @@ def main(args=None):
     rclpy.init(args=args)
     prompt_engine = Prompt()
 
-    # Run the Pygame GUI in a separate thread
-    pygame_thread = threading.Thread(target=prompt_engine.proc, daemon=True)
-    pygame_thread.start()
+    spin_thread = threading.Thread(target=rclpy.spin, args=(prompt_engine,), daemon=True)
+    spin_thread.start()
 
     try:
-        rclpy.spin(prompt_engine)
+        prompt_engine.proc()
     except KeyboardInterrupt:
         print("Shutting down due to KeyboardInterrupt.")
     finally:
+        try:
+            prompt_engine.tts_stream.stop()
+            prompt_engine.tts_stream.close()
+        except Exception:
+            pass
         prompt_engine.destroy_node()
         rclpy.shutdown()
         # clean_exit()
