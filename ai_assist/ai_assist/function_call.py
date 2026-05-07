@@ -291,37 +291,34 @@ class Prompt(Node):
     def move(self, distance=0.0, angle=0.0):
         linear_speed = 1.0     # meters per second
         angular_speed = 0.5    # radians per second
+        rate_hz = 50.0
+        period = 1.0 / rate_hz
         msg = Twist()
 
-        # Calculate duration
         linear_duration = abs(distance) / linear_speed if distance != 0 else 0
         angular_duration = abs(angle) / angular_speed if angle != 0 else 0
 
-        # Move linearly
         if distance != 0:
             msg.linear.x = linear_speed if distance > 0 else -linear_speed
             msg.angular.z = 0.0
             start_time = time.time()
             while time.time() - start_time < linear_duration:
                 self.publisher_.publish(msg)
-                time.sleep(0.1)
+                time.sleep(period)
 
-        # Rotate
         if angle != 0:
             msg.linear.x = 0.0
             msg.angular.z = angular_speed if angle > 0 else -angular_speed
             start_time = time.time()
             while time.time() - start_time < angular_duration:
                 self.publisher_.publish(msg)
-                time.sleep(0.1)
+                time.sleep(period)
 
-        # Stop the robot
         self.stop_robot()
 
 
     def stop_robot(self):
-        time.sleep(1)
-        self.publisher_.publish(Twist())  # Stop after a short move
+        self.publisher_.publish(Twist())
 
     def look_around(self, n_frames=4, total_angle_rad=2 * math.pi):
         try:
